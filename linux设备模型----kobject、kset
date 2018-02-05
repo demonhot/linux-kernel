@@ -1,0 +1,424 @@
+struct kobject {
+	const char		*name;    //sysfs系统中显示的名称
+	struct list_head	entry;    //插入kset的list中
+	struct kobject		*parent;    //kobject的父节点,在sysfs中构建层次结构
+	struct kset		*kset;    //理解为一种特殊的kobject，是同一类kobject的集合
+	struct kobj_type	*ktype;   //kobject的文件操作集合，kobject初始化都需要指定ktype
+	struct sysfs_dirent	*sd;    //sysfs相关
+	struct kref		kref;   //引用计数
+	unsigned int state_initialized:1;   //初始化状态标志
+	unsigned int state_in_sysfs:1;    //是否在sysfs中创建
+	unsigned int state_add_uevent_sent:1;   //向用户空间发送add事件标志
+	unsigned int state_remove_uevent_sent:1;    //向用户空间发送remove事件标志
+	unsigned int uevent_suppress:1;   //字段为1，忽略所有的上报事件
+};
+
+/*
+ * 初始化kobject结构体
+ * kobject_init必须指定ktype
+ * 该kobject已经初始化OK，打印堆栈信息，不返回
+ * kobject_init_internal,初始化
+ */
+void kobject_init(struct kobject *kobj, struct kobj_type *ktype)
+{
+	char *err_str;
+
+	if (!kobj) {
+		err_str = "invalid kobject pointer!";
+		goto error;
+	}
+	if (!ktype) {
+		err_str = "must have a ktype to be initialized properly!\n";
+		goto error;
+	}
+	if (kobj->state_initialized) {
+		/* do not error out as sometimes we can recover */
+		printk(KERN_ERR "kobject (%p): tried to init an initialized "
+		       "object, something is seriously wrong.\n", kobj);
+		dump_stack();
+	}
+
+	kobject_init_internal(kobj);
+	kobj->ktype = ktype;
+	return;
+
+error:
+	printk(KERN_ERR "kobject (%p): %s\n", kobj, err_str);
+	dump_stack();
+}
+
+/*
+ * kref初始化，引用次数初始化为1
+ * 初始化链表节点
+ * 初始化状态标志位，state_initialized标志位赋为1
+ */
+static void kobject_init_internal(struct kobject *kobj)
+{
+	if (!kobj)
+		return;
+	kref_init(&kobj->kref);
+	INIT_LIST_HEAD(&kobj->entry);
+	kobj->state_in_sysfs = 0;
+	kobj->state_add_uevent_sent = 0;
+	kobj->state_remove_uevent_sent = 0;
+	kobj->state_initialized = 1;
+}
+
+/*
+ * kobject未初始化，则报错返回
+ * kobject_add_varg调用kobject_add_internal
+ */
+int kobject_add(struct kobject *kobj, struct kobject *parent,
+		const char *fmt, ...)
+{
+	va_list args;
+	int retval;
+
+	if (!kobj)
+		return -EINVAL;
+
+	if (!kobj->state_initialized) {
+		printk(KERN_ERR "kobject '%s' (%p): tried to add an "
+		       "uninitialized object, something is seriously wrong.\n",
+		       kobject_name(kobj), kobj);
+		dump_stack();
+		return -EINVAL;
+	}
+	va_start(args, fmt);
+	retval = kobject_add_varg(kobj, parent, fmt, args);
+	va_end(args);
+
+	return retval;
+}
+
+/*
+ * 定义parent节点，则parent节点的kref引用加1
+ * kset定义&&parent未定义，则parent指向kset所属kobject的kref引用加1
+ * kobj_kset_join，kobject加入kset链表，kref引用加1
+ * sysfs文件系统中创建目录，调用sysfs_create_dir
+ */
+static int kobject_add_internal(struct kobject *kobj)
+{
+	int error = 0;
+	struct kobject *parent;
+
+	if (!kobj)
+		return -ENOENT;
+
+	if (!kobj->name || !kobj->name[0]) {
+		WARN(1, "kobject: (%p): attempted to be registered with empty "
+			 "name!\n", kobj);
+		return -EINVAL;
+	}
+
+	parent = kobject_get(kobj->parent);
+
+	/* join kset if set, use it as parent if we do not already have one */
+	if (kobj->kset) {
+		if (!parent)
+			parent = kobject_get(&kobj->kset->kobj);
+		kobj_kset_join(kobj);
+		kobj->parent = parent;
+	}
+
+	pr_debug("kobject: '%s' (%p): %s: parent: '%s', set: '%s'\n",
+		 kobject_name(kobj), kobj, __func__,
+		 parent ? kobject_name(parent) : "<NULL>",
+		 kobj->kset ? kobject_name(&kobj->kset->kobj) : "<NULL>");
+
+	error = create_dir(kobj);
+	if (error) {
+		kobj_kset_leave(kobj);
+		kobject_put(parent);
+		kobj->parent = NULL;
+
+		/* be noisy on error issues */
+		if (error == -EEXIST)
+			WARN(1, "%s failed for %s with "
+			     "-EEXIST, don't try to register things with "
+			     "the same name in the same directory.\n",
+			     __func__, kobject_name(kobj));
+		else
+			WARN(1, "%s failed for %s (error: %d parent: %s)\n",
+			     __func__, kobject_name(kobj), error,
+			     parent ? kobject_name(parent) : "'none'");
+	} else
+		kobj->state_in_sysfs = 1;
+
+	return error;
+}
+
+/*
+ * 如果未指定父节点，则在根目录/sys/下创建目录
+ */
+int sysfs_create_dir(struct kobject * kobj)
+{
+	enum kobj_ns_type type;
+	struct sysfs_dirent *parent_sd, *sd;
+	const void *ns = NULL;
+	int error = 0;
+
+	BUG_ON(!kobj);
+
+	if (kobj->parent)
+		parent_sd = kobj->parent->sd;
+	else
+		parent_sd = &sysfs_root;
+
+	if (!parent_sd)
+		return -ENOENT;
+
+	if (sysfs_ns_type(parent_sd))
+		ns = kobj->ktype->namespace(kobj);
+	type = sysfs_read_ns_type(kobj);
+
+	error = create_dir(kobj, parent_sd, type, ns, kobject_name(kobj), &sd);
+	if (!error)
+		kobj->sd = sd;
+	return error;
+}
+
+
+kobject_init_and_add:就是kobject_init和kobject_add的组合
+
+/*
+ * 动态创建kobject，初始化使用dynamic_kobj_ktype（使用默认的release函数）
+ */
+struct kobject *kobject_create(void)
+{
+	struct kobject *kobj;
+
+	kobj = kzalloc(sizeof(*kobj), GFP_KERNEL);
+	if (!kobj)
+		return NULL;
+
+	kobject_init(kobj, &dynamic_kobj_ktype);
+	return kobj;
+}
+
+/*
+ * 动态创建kobject并将其注册到sysfs文件系统中
+ */
+struct kobject *kobject_create_and_add(const char *name, struct kobject *parent)
+{
+	struct kobject *kobj;
+	int retval;
+
+	kobj = kobject_create();
+	if (!kobj)
+		return NULL;
+
+	retval = kobject_add(kobj, parent, "%s", name);
+	if (retval) {
+		printk(KERN_WARNING "%s: kobject_add error: %d\n",
+		       __func__, retval);
+		kobject_put(kobj);
+		kobj = NULL;
+	}
+	return kobj;
+}
+
+/*
+ * kref引用次数加1
+ */
+struct kobject *kobject_get(struct kobject *kobj)
+{
+	if (kobj)
+		kref_get(&kobj->kref);
+	return kobj;
+}
+
+/*
+ * kref引用次数减1，如果减少为0，则调用kobject_release函数
+ */
+void kobject_put(struct kobject *kobj)
+{
+	if (kobj) {
+		if (!kobj->state_initialized)
+			WARN(1, KERN_WARNING "kobject: '%s' (%p): is not "
+			       "initialized, yet kobject_put() is being "
+			       "called.\n", kobject_name(kobj), kobj);
+		kref_put(&kobj->kref, kobject_release);
+	}
+}
+static void kobject_release(struct kref *kref)
+{
+	kobject_cleanup(container_of(kref, struct kobject, kref));
+}
+/*
+ * 判断是否定义ktype的release回调函数
+ * 如果上报过add，未上报remove，上报remove事件
+ * 在sysfs中删除，state_in_sysfs标志位，kset&parent中解除连接
+ * 调用ktype release回调函数
+ * free掉name空间
+ */
+static void kobject_cleanup(struct kobject *kobj)
+{
+	struct kobj_type *t = get_ktype(kobj);
+	const char *name = kobj->name;
+
+	pr_debug("kobject: '%s' (%p): %s\n",
+		 kobject_name(kobj), kobj, __func__);
+
+	if (t && !t->release)
+		pr_debug("kobject: '%s' (%p): does not have a release() "
+			 "function, it is broken and must be fixed.\n",
+			 kobject_name(kobj), kobj);
+
+	/* send "remove" if the caller did not do it but sent "add" */
+	if (kobj->state_add_uevent_sent && !kobj->state_remove_uevent_sent) {
+		pr_debug("kobject: '%s' (%p): auto cleanup 'remove' event\n",
+			 kobject_name(kobj), kobj);
+		kobject_uevent(kobj, KOBJ_REMOVE);
+	}
+
+	/* remove from sysfs if the caller did not do it */
+	if (kobj->state_in_sysfs) {
+		pr_debug("kobject: '%s' (%p): auto cleanup kobject_del\n",
+			 kobject_name(kobj), kobj);
+		kobject_del(kobj);
+	}
+
+	if (t && t->release) {
+		pr_debug("kobject: '%s' (%p): calling ktype release\n",
+			 kobject_name(kobj), kobj);
+		t->release(kobj);
+	}
+
+	/* free name if we allocated it */
+	if (name) {
+		pr_debug("kobject: '%s': free name\n", name);
+		kfree(name);
+	}
+}
+
+/*
+ * ktype结构体
+ * release：将包含kobject的数据结构的内存空间释放掉
+ * sysfs_ops：该种类型的Kobject的sysfs文件系统接口
+ * default_attrs：kobject目录下的文件
+ * child_ns_type && namespace与文件系统命名有关
+struct kobj_type {
+	void (*release)(struct kobject *kobj);
+	const struct sysfs_ops *sysfs_ops;
+	struct attribute **default_attrs;
+	const struct kobj_ns_type_operations *(*child_ns_type)(struct kobject *kobj);
+	const void *(*namespace)(struct kobject *kobj);
+};
+
+/*
+ * list链表头
+ * list自旋锁
+ * 内嵌的kobject
+ * uevent_ops：该kset的uevent操作函数集。当任何Kobject需要上报uevent时，都要调用它所从属的kset的uevent_ops，
+ * 添加环境变量，或者过滤event（kset可以决定哪些event可以上报）。因此，如果一个kobject不属于任何kset时，是不允许发送uevent的
+ */
+struct kset {
+	struct list_head list;
+	spinlock_t list_lock;
+	struct kobject kobj;
+	const struct kset_uevent_ops *uevent_ops;
+};
+
+/*
+ * 初始化kobject
+ * list
+ * list自旋锁
+ */
+void kset_init(struct kset *k)
+{
+	kobject_init_internal(&k->kobj);
+	INIT_LIST_HEAD(&k->list);
+	spin_lock_init(&k->list_lock);
+}
+
+/*
+ * kset初始化
+ * kobject加入sysfs文件系统
+ * kobject向用户空间上报add事件
+ */
+int kset_register(struct kset *k)
+{
+	int err;
+
+	if (!k)
+		return -EINVAL;
+
+	kset_init(k);
+	err = kobject_add_internal(&k->kobj);
+	if (err)
+		return err;
+	kobject_uevent(&k->kobj, KOBJ_ADD);
+	return 0;
+}
+
+/*
+ * 动态创建kset，并将其加入sysfs文件系统
+ * 调用kset_create && kset_register
+ */
+struct kset *kset_create_and_add(const char *name,
+				 const struct kset_uevent_ops *uevent_ops,
+				 struct kobject *parent_kobj)
+{
+	struct kset *kset;
+	int error;
+
+	kset = kset_create(name, uevent_ops, parent_kobj);
+	if (!kset)
+		return NULL;
+	error = kset_register(kset);
+	if (error) {
+		kfree(kset);
+		return NULL;
+	}
+	return kset;
+}
+
+/*
+ * 动态创建kset
+ * kset所属的kobject->ktype设置为kset_ktype
+ * kset所属的kobject->kset设置为NULL
+ */
+static struct kset *kset_create(const char *name,
+				const struct kset_uevent_ops *uevent_ops,
+				struct kobject *parent_kobj)
+{
+	struct kset *kset;
+	int retval;
+
+	kset = kzalloc(sizeof(*kset), GFP_KERNEL);
+	if (!kset)
+		return NULL;
+	retval = kobject_set_name(&kset->kobj, name);
+	if (retval) {
+		kfree(kset);
+		return NULL;
+	}
+	kset->uevent_ops = uevent_ops;
+	kset->kobj.parent = parent_kobj;
+
+	/*
+	 * The kobject of this kset will have a type of kset_ktype and belong to
+	 * no kset itself.  That way we can properly free it when it is
+	 * finished being used.
+	 */
+	kset->kobj.ktype = &kset_ktype;
+	kset->kobj.kset = NULL;
+
+	return kset;
+}
+
+kset_get && kset_put 分别调用kobject_get && kobject_set
+
+
+一.kobject的初始化
+  1.通过上层结构kmalloc分配，调用kobject_init && kobject_add && kobject_init_add_add接口
+  2.调用kobject_create_add_add，通过kobject_create分配空间，并且使用默认的ktype（dynamic_kobj_ktype）
+ 
+二.kobject引用计数的修改
+  通过kobject_get && kobject_put来增加或减少引用计数，当引用计数减少为0时，释放空间并执行release函数
+  
+三.kset的初始化和注册
+  1.通过上层结构进行分配，调用kset_init && kset_register函数进行初始化和注册
+  2.kset_create_and_add，动态分配和注册。ktype默认为kset_ktype
+  
