@@ -293,6 +293,24 @@ static void kobject_cleanup(struct kobject *kobj)
 }
 
 /*
+ * 从sysfs中移除目录
+ * 更新state_in_sysfs状态标志位
+ * 从kset子集中分离
+ * kobject->parent节点引用次数减1
+ * /
+void kobject_del(struct kobject *kobj)
+{
+	if (!kobj)
+		return;
+
+	sysfs_remove_dir(kobj);
+	kobj->state_in_sysfs = 0;
+	kobj_kset_leave(kobj);
+	kobject_put(kobj->parent);
+	kobj->parent = NULL;
+}
+
+/*
  * ktype结构体
  * release：将包含kobject的数据结构的内存空间释放掉
  * sysfs_ops：该种类型的Kobject的sysfs文件系统接口
