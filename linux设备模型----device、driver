@@ -63,7 +63,6 @@ struct device {
 	void	(*release)(struct device *dev);   //设备释放回调函数
 	struct iommu_group	*iommu_group;
 };
-
 二.device_type结构体
 设备的类型，class或者bus包含各种类型的设备，比如“分区”和“磁盘”，“鼠标”和“事件”。device & device_type的关系类似于kobject & kobj_type的关系
 struct device_type {
@@ -76,7 +75,6 @@ struct device_type {
 
 	const struct dev_pm_ops *pm;    //电源相关操作
 };
-
 三.device相关API
 设备初始化：device_initialize
 设备注册内核：device_add
@@ -101,19 +99,17 @@ void device_initialize(struct device *dev)
 	device_pm_init(dev);
 	set_dev_node(dev, -1);
 }
-
-/*
- * 117-121，判断device->p是否存在，否则进行初始化
- * 129-132，定义init_name，则设置为kobject的name，并将init_name置为NULL，强制使用dev_name函数获取device的name
- * 137-143，未定义name，则使用bus->devname##dev->id进行枚举
- * 147-150，增加父设备引用次数及其获取父设备的kobject
- * 159-161，注册kobject到文件系统
- * 169-176，在设备文件目录下创建uevent&dev文件，uevent环境变量，dev主次设备号,device_create_file调用sysfs_create_file
- * 180，在/sys/dev/char/或者/sys/dev/block/创建devt的属性的连接文件,形如10:45,由主设备号和次设备号构成,指向/sys/devices/.../的具体设备目录,
+/* 128-132，判断device->p是否存在，否则进行初始化
+ * 139-142，定义init_name，则设置为kobject的name，并将init_name置为NULL，强制使用dev_name函数获取device的name
+ * 144-146，未定义name，则使用bus->devname##dev->id进行枚举，例如USB设备
+ * 155-158，增加父设备引用次数及其获取父设备的kobject
+ * 166，注册kobject到文件系统
+ * 174-181，在设备文件目录下创建uevent&dev文件，uevent环境变量，dev主次设备号,device_create_file调用sysfs_create_file
+ * 183，在/sys/dev/char/或者/sys/dev/block/创建devt的属性的连接文件,形如10:45,由主设备号和次设备号构成,指向/sys/devices/.../的具体设备目录,
  * 该链接文件只具备读属性，显示主设备号：次设备号，如10:45,用户空间udev相应uevent事件时，将根据设备号在/dev下创建节点文件
- * 185，相互创建dev和class之间的链接文件
- * 191，创建设备属性文件
- * 195，添加设备到总线上，将设备添加到总线的设备链表中
+ * 190，相互创建dev和class之间的链接文件
+ * 193，创建设备属性文件
+ * 196，添加设备到总线上，将设备添加到总线的设备链表中
  * 211，产生ADD uevent事件，上报到用户空间
  * 213，在总线上寻到匹配的driver，根据总线的match函数进行匹配
  * 214-222，将设备链表节点添加到parent和class的链表中
