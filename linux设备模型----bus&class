@@ -1,0 +1,354 @@
+一.bus结构体
+struct bus_type {
+	const char		*name;    //bus的name
+	const char		*dev_name;    //用于子系统枚举设备name，bus->devname##device->id
+	struct device		*dev_root;    //默认的父设备
+	struct bus_attribute	*bus_attrs;   //默认的bus属性
+	struct device_attribute	*dev_attrs;	/* use dev_groups instead */    //默认的总线上设备的属性，使用attribute_group
+	struct driver_attribute	*drv_attrs;   //默认的总线上设备驱动的属性
+	const struct attribute_group **dev_groups;    //默认的总线上设备的属性
+
+	int (*match)(struct device *dev, struct device_driver *drv);    //bus上设备和驱动match的回调函数
+	int (*uevent)(struct device *dev, struct kobj_uevent_env *env);   //上报事件的回调函数
+	int (*probe)(struct device *dev);   //probe回调函数
+	int (*remove)(struct device *dev);    
+	void (*shutdown)(struct device *dev);
+
+	int (*suspend)(struct device *dev, pm_message_t state);
+	int (*resume)(struct device *dev);
+
+	const struct dev_pm_ops *pm;    //电源相关
+
+	struct iommu_ops *iommu_ops;    
+
+	struct subsys_private *p;   //总线驱动私有数据
+	struct lock_class_key lock_key;
+};
+
+struct subsys_private {
+	struct kset subsys;   //子系统kset，例如/sys/bus/platform
+	struct kset *devices_kset;    //总线下的devices kset,例如/sys/bus/platform/devices
+	struct list_head interfaces;    //子系统list_head，用于保存bus下所有的interface，
+	struct mutex mutex;
+
+	struct kset *drivers_kset;    //总线下的drivers kset,例如/sys/bus/platform/drivers
+	struct klist klist_devices;   //总线下的设备集合
+	struct klist klist_drivers;   //总线下的设备驱动集合
+	struct blocking_notifier_head bus_notifier;
+	unsigned int drivers_autoprobe:1;   //自动probe标志位
+	struct bus_type *bus;   
+
+	struct kset glue_dirs;
+	struct class *class;
+};
+/*
+ * node添加到bus->p->interfaces链表中
+ * bus下有设备添加或者移除时，会调用subsys_interface下的add_dev&remove_dev函数
+ */
+struct subsys_interface {
+	const char *name;
+	struct bus_type *subsys;
+	struct list_head node;
+	int (*add_dev)(struct device *dev, struct subsys_interface *sif);
+	int (*remove_dev)(struct device *dev, struct subsys_interface *sif);
+};
+
+
+二.bus API
+/* 
+ * 注册总线到内核，如注册platform总线,生成/sys/bus/platform/目录
+ * 并在platform目录下创建devices和drivers目录，存放各种设备和驱动
+ * 初始化设备和驱动链表klist，后续的匹配就是从klist里面查找匹配的设备和驱动
+ * 目录下创建文件
+ */
+int bus_register(struct bus_type *bus)
+{
+	int retval;
+	struct subsys_private *priv;
+	struct lock_class_key *key = &bus->lock_key;
+//申请subsys_private空间
+	priv = kzalloc(sizeof(struct subsys_private), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	priv->bus = bus;
+	bus->p = priv;
+
+	BLOCKING_INIT_NOTIFIER_HEAD(&priv->bus_notifier);
+//设置bus下子系统name，如/sys/bus/platform
+	retval = kobject_set_name(&priv->subsys.kobj, "%s", bus->name);
+	if (retval)
+		goto out;
+//设置子系统kobject的kset ktype，支持自动probe
+//buses_init函数里面定义了bus_kset = kset_create_and_add("bus", &bus_uevent_ops, NULL);
+	priv->subsys.kobj.kset = bus_kset;
+	priv->subsys.kobj.ktype = &bus_ktype;
+	priv->drivers_autoprobe = 1;
+//kset_register，子系统注册到内核
+	retval = kset_register(&priv->subsys);
+	if (retval)
+		goto out;
+//子系统下创建uevent文件
+	retval = bus_create_file(bus, &bus_attr_uevent);
+	if (retval)
+		goto bus_uevent_fail;
+//子系统下创建devices目录
+	priv->devices_kset = kset_create_and_add("devices", NULL,
+						 &priv->subsys.kobj);
+	if (!priv->devices_kset) {
+		retval = -ENOMEM;
+		goto bus_devices_fail;
+	}
+//子系统下创建drivers目录
+	priv->drivers_kset = kset_create_and_add("drivers", NULL,
+						 &priv->subsys.kobj);
+	if (!priv->drivers_kset) {
+		retval = -ENOMEM;
+		goto bus_drivers_fail;
+	}
+//初始化interfaces list_head;设备和驱动链表
+	INIT_LIST_HEAD(&priv->interfaces);
+	__mutex_init(&priv->mutex, "subsys mutex", key);
+	klist_init(&priv->klist_devices, klist_devices_get, klist_devices_put);
+	klist_init(&priv->klist_drivers, NULL, NULL);
+//子系统下增加drivers_autoprobe和drivers_probe文件
+	retval = add_probe_files(bus);
+	if (retval)
+		goto bus_probe_files_fail;
+//总线下创建属性文件
+	retval = bus_add_attrs(bus);
+	if (retval)
+		goto bus_attrs_fail;
+
+	pr_debug("bus: '%s': registered\n", bus->name);
+	return 0;
+
+bus_attrs_fail:
+	remove_probe_files(bus);
+bus_probe_files_fail:
+	kset_unregister(bus->p->drivers_kset);
+bus_drivers_fail:
+	kset_unregister(bus->p->devices_kset);
+bus_devices_fail:
+	bus_remove_file(bus, &bus_attr_uevent);
+bus_uevent_fail:
+	kset_unregister(&bus->p->subsys);
+out:
+	kfree(bus->p);
+	bus->p = NULL;
+	return retval;
+}
+
+/*
+ * 设备添加属性bus->dev_attrs & bus->dev_groups
+ * 在/sys/bus/xxx/devices/下新建设备的软链接，指向dev->kobj
+ * dev->kobj，目录下新建subsystem链接，指向/sys/bus/xxx/目录
+ * 设备添加到总线设备链表中
+ */
+int bus_add_device(struct device *dev)
+{
+	struct bus_type *bus = bus_get(dev->bus);
+	int error = 0;
+
+	if (bus) {
+		pr_debug("bus: '%s': add device %s\n", bus->name, dev_name(dev));
+		error = device_add_attrs(bus, dev);
+		if (error)
+			goto out_put;
+		error = device_add_groups(dev, bus->dev_groups);
+		if (error)
+			goto out_groups;
+		error = sysfs_create_link(&bus->p->devices_kset->kobj,
+						&dev->kobj, dev_name(dev));
+		if (error)
+			goto out_id;
+		error = sysfs_create_link(&dev->kobj,
+				&dev->bus->p->subsys.kobj, "subsystem");
+		if (error)
+			goto out_subsys;
+		klist_add_tail(&dev->p->knode_bus, &bus->p->klist_devices);
+	}
+	return 0;
+
+out_subsys:
+	sysfs_remove_link(&bus->p->devices_kset->kobj, dev_name(dev));
+out_groups:
+	device_remove_groups(dev, bus->dev_groups);
+out_id:
+	device_remove_attrs(bus, dev);
+out_put:
+	bus_put(dev->bus);
+	return error;
+}
+
+/* 
+ * 总线添加驱动
+ * 确定驱动的层次结构，放在/sys/bus/xxx/drivers/目录下
+ * 初始化并注册驱动的kobject
+ * 添加到总线驱动链表，并查找匹配设备进行匹配
+ * /
+int bus_add_driver(struct device_driver *drv)
+{
+	struct bus_type *bus;
+	struct driver_private *priv;
+	int error = 0;
+
+	bus = bus_get(drv->bus);
+	if (!bus)
+		return -EINVAL;
+
+	pr_debug("bus: '%s': add driver %s\n", bus->name, drv->name);
+//分配driver_private空间
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv) {
+		error = -ENOMEM;
+		goto out_put_bus;
+	}
+  //初始化驱动的设备链表（驱动与设备是一对多的关系）
+  klist_init(&priv->klist_devices, NULL, NULL);
+	priv->driver = drv;
+	drv->p = priv;
+  //层次关系，驱动的kset为drivers_kset，也就是驱动放在/sys/bus/xxx/drivers/目录下
+	priv->kobj.kset = bus->p->drivers_kset;
+  //初始化并注册驱动kobject
+	error = kobject_init_and_add(&priv->kobj, &driver_ktype, NULL,
+				     "%s", drv->name);
+	if (error)
+		goto out_unregister;
+//驱动添加到总线驱动链表中，并进行匹配动作
+	klist_add_tail(&priv->knode_bus, &bus->p->klist_drivers);
+	if (drv->bus->p->drivers_autoprobe) {
+		error = driver_attach(drv);
+		if (error)
+			goto out_unregister;
+	}
+	module_add_driver(drv->owner, drv);
+//添加uevent文件
+	error = driver_create_file(drv, &driver_attr_uevent);
+	if (error) {
+		printk(KERN_ERR "%s: uevent attr (%s) failed\n",
+			__func__, drv->name);
+	}
+  //添加bus->drv_attrs属性
+	error = driver_add_attrs(bus, drv);
+	if (error) {
+		/* How the hell do we get out of this pickle? Give up */
+		printk(KERN_ERR "%s: driver_add_attrs(%s) failed\n",
+			__func__, drv->name);
+	}
+//如果suppress_bind_attrs为0，在驱动目录下创建bind和unbind文件
+	if (!drv->suppress_bind_attrs) {
+		error = add_bind_files(drv);
+		if (error) {
+			/* Ditto */
+			printk(KERN_ERR "%s: add_bind_files(%s) failed\n",
+				__func__, drv->name);
+		}
+	}
+
+	return 0;
+
+out_unregister:
+	kobject_put(&priv->kobj);
+	kfree(drv->p);
+	drv->p = NULL;
+out_put_bus:
+	bus_put(bus);
+	return error;
+}
+
+
+三.class结构体
+
+struct class {
+	const char		*name;    
+	struct module		*owner;
+
+	struct class_attribute		*class_attrs;   //class下的属性文件
+	struct device_attribute		*dev_attrs;   //class下设备属性文件
+	struct bin_attribute		*dev_bin_attrs;   //二进制属性文件
+	struct kobject			*dev_kobj;    //class类设备属于char型还是block型，默认为/sys/dev/char/
+
+	int (*dev_uevent)(struct device *dev, struct kobj_uevent_env *env);
+	char *(*devnode)(struct device *dev, umode_t *mode);
+
+	void (*class_release)(struct class *class);
+	void (*dev_release)(struct device *dev);
+
+	int (*suspend)(struct device *dev, pm_message_t state);
+	int (*resume)(struct device *dev);
+
+	const struct kobj_ns_type_operations *ns_type;
+	const void *(*namespace)(struct device *dev);
+
+	const struct dev_pm_ops *pm;
+
+	struct subsys_private *p;   //和bus的私有数据相似
+};
+
+/*
+ * 和subsys_interface相似
+ * 定义了class_interface，有设备添加或者移除时需要执行add_dev & remove_dev函数
+ */
+struct class_interface {
+	struct list_head	node;
+	struct class		*class;
+
+	int (*add_dev)		(struct device *, struct class_interface *);
+	void (*remove_dev)	(struct device *, struct class_interface *);
+};
+
+四.class API
+/*
+ * 注册class到内核
+ */
+int __class_register(struct class *cls, struct lock_class_key *key)
+{
+	struct subsys_private *cp;
+	int error;
+
+	pr_debug("device class '%s': registering\n", cls->name);
+//分配私有数据空间
+	cp = kzalloc(sizeof(*cp), GFP_KERNEL);
+	if (!cp)
+		return -ENOMEM;
+//初始化class的设备链表和interface链表
+	klist_init(&cp->klist_devices, klist_class_dev_get, klist_class_dev_put);
+	INIT_LIST_HEAD(&cp->interfaces);
+	kset_init(&cp->glue_dirs);
+	__mutex_init(&cp->mutex, "subsys mutex", key);
+//设置class kobject的name
+	error = kobject_set_name(&cp->subsys.kobj, "%s", cls->name);
+	if (error) {
+		kfree(cp);
+		return error;
+	}
+//cls->dev_kobj默认为char型，在/sys/dev/char/目录下
+	/* set the default /sys/dev directory for devices of this class */
+	if (!cls->dev_kobj)
+		cls->dev_kobj = sysfs_dev_char_kobj;
+//该类的kset设置为class，表示在/sys/class/目录下
+#if defined(CONFIG_BLOCK)
+	/* let the block class directory show up in the root of sysfs */
+	if (!sysfs_deprecated || cls != &block_class)
+		cp->subsys.kobj.kset = class_kset;
+#else
+	cp->subsys.kobj.kset = class_kset;
+#endif
+	cp->subsys.kobj.ktype = &class_ktype;
+	cp->class = cls;
+	cls->p = cp;
+//注册class类，生成/sys/class/xxx目录
+	error = kset_register(&cp->subsys);
+	if (error) {
+		kfree(cp);
+		return error;
+	}
+//添加类属性
+	error = add_class_attrs(class_get(cls));
+	class_put(cls);
+	return error;
+}
+EXPORT_SYMBOL_GPL(__class_register);
+
+
