@@ -1,1 +1,199 @@
+platform设备一个共通点：通过cpu bus直接寻址
+
+一.结构体
+
+struct platform_device {
+	const char	*name;    //设备name
+	int		id;       //设备id
+	bool		id_auto;    //自动设置id标志位
+	struct device	dev;    //设备
+	u32		num_resources;      //资源数量
+	struct resource	*resource;    //平台设备资源：包括I/O,memory,register,irq,DMA等
+
+	const struct platform_device_id	*id_entry;    //匹配时使用
+
+	/* MFD cell pointer */
+	struct mfd_cell *mfd_cell;
+
+	/* arch specific additions */
+	struct pdev_archdata	archdata;     //存放一些architecture的数据
+};
+
+struct platform_driver {
+	int (*probe)(struct platform_device *);
+	int (*remove)(struct platform_device *);
+	void (*shutdown)(struct platform_device *);
+	int (*suspend)(struct platform_device *, pm_message_t state);
+	int (*resume)(struct platform_device *);
+	struct device_driver driver;
+	const struct platform_device_id *id_table;    //设备驱动match时使用，驱动支持的设备id列表
+};
+
+二.platform初始化
+/*
+ * init.c的driver_init调用platform_bus_init，进行初始化
+ */
+void __init driver_init(void)
+{
+	/* These are the core pieces */
+	devtmpfs_init();
+	devices_init();
+	buses_init();
+	classes_init();
+	firmware_init();
+	hypervisor_init();
+
+	/* These are also core pieces, but must come after the
+	 * core core pieces.
+	 */
+	platform_bus_init();
+	cpu_dev_init();
+	memory_dev_init();
+}
+
+int __init platform_bus_init(void)
+{
+	int error;
+
+	early_platform_cleanup();   //清理设备链表中的devres list
+
+	error = device_register(&platform_bus);   //注册平台设备，生成/sys/devices/platform目录
+	if (error)
+		return error;
+	error =  bus_register(&platform_bus_type);    //注册总线，生成/sys/bus/platform目录，以及一些子目录和文件属性
+	if (error)
+		device_unregister(&platform_bus);
+	return error;
+}
+
+struct bus_type platform_bus_type = {
+	.name		= "platform",
+	.dev_attrs	= platform_dev_attrs,   //平台设备属性
+	.match		= platform_match,   //匹配执行函数
+	.uevent		= platform_uevent,    //平台设备环境变量
+	.pm		= &platform_dev_pm_ops,   //电源管理
+}; 
+
+/*
+ * 注册平台设备和驱动时执行匹配函数 
+ * 驱动的of_match_table -> APCI -> 驱动id_table -> 设备与驱动的name，按照此优先级执行match函数
+ */
+
+static int platform_match(struct device *dev, struct device_driver *drv)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct platform_driver *pdrv = to_platform_driver(drv);
+
+	/* Attempt an OF style match first */
+	if (of_driver_match_device(dev, drv))
+		return 1;
+
+	/* Then try ACPI style match */
+	if (acpi_driver_match_device(dev, drv))
+		return 1;
+
+	/* Then try to match against the id table */
+	if (pdrv->id_table)
+		return platform_match_id(pdrv->id_table, pdev) != NULL;
+
+	/* fall-back to driver name match */
+	return (strcmp(pdev->name, drv->name) == 0);
+}
+
+
+三. API
+
+/*
+ * 注册平台设备
+ * platform_device_add
+ */
+int platform_device_register(struct platform_device *pdev)
+{
+	device_initialize(&pdev->dev);
+	arch_setup_pdev_archdata(pdev);
+	return platform_device_add(pdev);
+}
+
+/*
+ * 添加平台设备到设备层次模型中
+ * 
+int platform_device_add(struct platform_device *pdev)
+{
+	int i, ret;
+
+	if (!pdev)
+		return -EINVAL;
+
+	if (!pdev->dev.parent)
+		pdev->dev.parent = &platform_bus;
+
+	pdev->dev.bus = &platform_bus_type;
+
+	switch (pdev->id) {
+	default:
+		dev_set_name(&pdev->dev, "%s.%d", pdev->name,  pdev->id);
+		break;
+	case PLATFORM_DEVID_NONE:
+		dev_set_name(&pdev->dev, "%s", pdev->name);
+		break;
+	case PLATFORM_DEVID_AUTO:
+		/*
+		 * Automatically allocated device ID. We mark it as such so
+		 * that we remember it must be freed, and we append a suffix
+		 * to avoid namespace collision with explicit IDs.
+		 */
+		ret = ida_simple_get(&platform_devid_ida, 0, 0, GFP_KERNEL);
+		if (ret < 0)
+			goto err_out;
+		pdev->id = ret;
+		pdev->id_auto = true;
+		dev_set_name(&pdev->dev, "%s.%d.auto", pdev->name, pdev->id);
+		break;
+	}
+
+	for (i = 0; i < pdev->num_resources; i++) {
+		struct resource *p, *r = &pdev->resource[i];
+
+		if (r->name == NULL)
+			r->name = dev_name(&pdev->dev);
+
+		p = r->parent;
+		if (!p) {
+			if (resource_type(r) == IORESOURCE_MEM)
+				p = &iomem_resource;
+			else if (resource_type(r) == IORESOURCE_IO)
+				p = &ioport_resource;
+		}
+
+		if (p && insert_resource(p, r)) {
+			dev_err(&pdev->dev, "failed to claim resource %d\n", i);
+			ret = -EBUSY;
+			goto failed;
+		}
+	}
+
+	pr_debug("Registering platform device '%s'. Parent at %s\n",
+		 dev_name(&pdev->dev), dev_name(pdev->dev.parent));
+
+	ret = device_add(&pdev->dev);
+	if (ret == 0)
+		return ret;
+
+ failed:
+	if (pdev->id_auto) {
+		ida_simple_remove(&platform_devid_ida, pdev->id);
+		pdev->id = PLATFORM_DEVID_AUTO;
+	}
+
+	while (--i >= 0) {
+		struct resource *r = &pdev->resource[i];
+		unsigned long type = resource_type(r);
+
+		if (type == IORESOURCE_MEM || type == IORESOURCE_IO)
+			release_resource(r);
+	}
+
+ err_out:
+	return ret;
+}
 
