@@ -105,7 +105,7 @@ static int platform_match(struct device *dev, struct device_driver *drv)
 
 /*
  * 注册平台设备
- * platform_device_add
+ * 调用platform_device_add
  */
 int platform_device_register(struct platform_device *pdev)
 {
@@ -197,3 +197,245 @@ int platform_device_add(struct platform_device *pdev)
 	return ret;
 }
 
+
+/**
+ * platform_device_alloc - 创建平台设备
+ * name和id分别赋值给pdev的成员
+ * strcpy复制包含name末尾的空字符'\0'，strlen（name）不包含空字符，所以结构体platform_object中预留一个字节的空间。
+ */
+struct platform_device *platform_device_alloc(const char *name, int id)
+{
+	struct platform_object *pa;
+
+	pa = kzalloc(sizeof(struct platform_object) + strlen(name), GFP_KERNEL);
+	if (pa) {
+		strcpy(pa->name, name);
+		pa->pdev.name = pa->name;
+		pa->pdev.id = id;
+		device_initialize(&pa->pdev.dev);
+		pa->pdev.dev.release = platform_device_release;
+		arch_setup_pdev_archdata(&pa->pdev);
+	}
+
+	return pa ? &pa->pdev : NULL;
+}
+
+struct platform_object {
+	struct platform_device pdev;
+	char name[1];
+};
+
+/*
+ * 获取平台资源
+ */
+struct resource *platform_get_resource(struct platform_device *dev,
+				       unsigned int type, unsigned int num)
+{
+	int i;
+
+	for (i = 0; i < dev->num_resources; i++) {
+		struct resource *r = &dev->resource[i];
+
+		if (type == resource_type(r) && num-- == 0)
+			return r;
+	}
+	return NULL;
+}
+
+/*
+ * 获取中断资源即中断号
+ */
+int platform_get_irq(struct platform_device *dev, unsigned int num)
+{
+#ifdef CONFIG_SPARC
+	/* sparc does not have irqs represented as IORESOURCE_IRQ resources */
+	if (!dev || num >= dev->archdata.num_irqs)
+		return -ENXIO;
+	return dev->archdata.irqs[num];
+#else
+	struct resource *r = platform_get_resource(dev, IORESOURCE_IRQ, num);
+
+	return r ? r->start : -ENXIO;
+#endif
+}
+
+/**
+ * platform_driver_register - 注册平台设备驱动
+ * drv->driver的总线类型为platform
+ * 如果定义了drv->probe，则执行platform_drv_probe，最终调用drv->probe函数
+ */
+int platform_driver_register(struct platform_driver *drv)
+{
+	drv->driver.bus = &platform_bus_type;
+	if (drv->probe)
+		drv->driver.probe = platform_drv_probe;
+	if (drv->remove)
+		drv->driver.remove = platform_drv_remove;
+	if (drv->shutdown)
+		drv->driver.shutdown = platform_drv_shutdown;
+
+	return driver_register(&drv->driver);
+}
+/*
+ * 调用drv->probe函数
+ */
+static int platform_drv_probe(struct device *_dev)
+{
+	struct platform_driver *drv = to_platform_driver(_dev->driver);
+	struct platform_device *dev = to_platform_device(_dev);
+	int ret;
+
+	if (ACPI_HANDLE(_dev))
+		acpi_dev_pm_attach(_dev, true);
+
+	ret = drv->probe(dev);
+	if (ret && ACPI_HANDLE(_dev))
+		acpi_dev_pm_detach(_dev, true);
+
+	return ret;
+}
+
+
+/*
+ * platform_driver_probe - 注册驱动应用非热插拔的设备
+ * 应用场合：设备非热插拔，已经在系统中注册，并且希望驱动与设备匹配后释放probe空间
+ */
+int __init_or_module platform_driver_probe(struct platform_driver *drv,
+		int (*probe)(struct platform_device *))
+{
+	int retval, code;
+
+	/* make sure driver won't have bind/unbind attributes */
+	drv->driver.suppress_bind_attrs = true;
+
+	/* temporary section violation during probe() */
+	drv->probe = probe;
+	retval = code = platform_driver_register(drv);
+
+	/*
+	 * Fixup that section violation, being paranoid about code scanning
+	 * the list of drivers in order to probe new devices.  Check to see
+	 * if the probe was successful, and make sure any forced probes of
+	 * new devices fail.
+	 */
+	spin_lock(&drv->driver.bus->p->klist_drivers.k_lock);
+	drv->probe = NULL;
+	if (code == 0 && list_empty(&drv->driver.p->klist_devices.k_list))
+		retval = -ENODEV;
+	drv->driver.probe = platform_drv_probe_fail;
+	spin_unlock(&drv->driver.bus->p->klist_drivers.k_lock);
+
+	if (code != retval)
+		platform_driver_unregister(drv);
+	return retval;
+}
+
+/* 
+ * platform_create_bundle - 注册平台驱动并且创建对应的设备
+ * 这个函数可以实现驱动和设备的注册，方便
+ */
+struct platform_device * __init_or_module platform_create_bundle(
+			struct platform_driver *driver,
+			int (*probe)(struct platform_device *),
+			struct resource *res, unsigned int n_res,
+			const void *data, size_t size)
+{
+	struct platform_device *pdev;
+	int error;
+
+	pdev = platform_device_alloc(driver->driver.name, -1);
+	if (!pdev) {
+		error = -ENOMEM;
+		goto err_out;
+	}
+
+	error = platform_device_add_resources(pdev, res, n_res);
+	if (error)
+		goto err_pdev_put;
+
+	error = platform_device_add_data(pdev, data, size);
+	if (error)
+		goto err_pdev_put;
+
+	error = platform_device_add(pdev);
+	if (error)
+		goto err_pdev_put;
+
+	error = platform_driver_probe(driver, probe);
+	if (error)
+		goto err_pdev_del;
+
+	return pdev;
+
+err_pdev_del:
+	platform_device_del(pdev);
+err_pdev_put:
+	platform_device_put(pdev);
+err_out:
+	return ERR_PTR(error);
+}
+
+/*
+ * 获取/设置dev的私有数据
+ * 用来存放平台相关的结构体
+ */
+
+static inline void *platform_get_drvdata(const struct platform_device *pdev)
+{
+	return dev_get_drvdata(&pdev->dev);
+}
+
+static inline void platform_set_drvdata(struct platform_device *pdev,
+					void *data)
+{
+	dev_set_drvdata(&pdev->dev, data);
+}
+
+
+四.early platform API
+目前还没用到过。。。这块直接转自蜗窝科技
+内核启动时，要完成一定的初始化操作之后，才会处理device和driver的注册及probe，因此在这之前，常规的platform设备是无法使用的。
+但是在Linux中，有些设备需要尽早使用（如在启动过程中充当console输出的serial设备），所以platform模块提供了一种称作Early platform device/driver的机制，
+允许驱动开发人员，在开发驱动时，向内核注册可在内核早期启动过程中使用的driver。这些机制提供了如下接口：
+early_platform_driver_register，注册一个用于Early device的driver。
+early_platform_add_devices，添加一个Early device。
+is_early_platform_device，判断指定的device是否是Early device。
+early_platform_driver_register_all，将指定class的所有driver注册为Early device driver。
+early_platform_driver_probe，probe指定class的Early device。
+early_platform_cleanup，清除所有的Early device/driver。
+
+五. 驱动编写
+经常看到如下的驱动注册：
+module_platform_driver(ldb_driver);
+/*
+ * 调用module_driver宏
+ */
+#define module_platform_driver(__platform_driver) \
+	module_driver(__platform_driver, platform_driver_register, \
+			platform_driver_unregister)
+/*
+ * 驱动初始化和卸载，分别调用platform_driver_register，platform_driver_unregister
+ */
+#define module_driver(__driver, __register, __unregister, ...) \
+static int __init __driver##_init(void) \
+{ \
+	return __register(&(__driver) , ##__VA_ARGS__); \
+} \
+module_init(__driver##_init); \
+static void __exit __driver##_exit(void) \
+{ \
+	__unregister(&(__driver) , ##__VA_ARGS__); \
+} \
+module_exit(__driver##_exit);
+
+以上的例子可以解析成如下,这样就熟悉多了.
+static int __init ldb_driver_init(void) 
+{ 
+	return platform_driver_register(&ldb_driver); 
+} 
+module_init(ldb_driver_init); 
+static void __exit ldb_driver_exit(void) 
+{ 
+	platform_driver_unregister(&ldb_driver); 
+} 
+module_exit(ldb_driver_exit);
